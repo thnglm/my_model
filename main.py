@@ -69,35 +69,26 @@ engine: AsyncLLMEngine | None = None
 ###############################################################################
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Lifecycle manager - lazy model loading with graceful shutdown
-    """
     global ready, engine
-
     print("🚀 Application starting up (lazy vLLM loading)...")
     ready = False
 
-    # Không load model ngay startup để tránh delay cold start
-    app.state.vllm_engine = None
+    if engine is None:  # ✅ chỉ preload 1 lần
+        try:
+            from services.vllm_service import vLLMService
+            print("⚙️ Preloading vLLM engine...")
+            engine = await vLLMService.init_resource()
+            app.state.vllm_engine = engine
+            ready = True
+            print("✅ vLLM engine ready!")
+        except Exception as e:
+            print(f"❌ Failed to preload engine: {e}")
+    else:
+        print("♻️ Engine already initialized, skipping preload...")
 
-    # Đăng ký shutdown hook để cleanup gọn
-    def graceful_shutdown(*_):
-        global engine
-        if engine:
-            print("🧹 Graceful shutdown: closing vLLM engine...")
-            try:
-                engine.shutdown()
-            except Exception:
-                pass
-            engine = None
-
-    signal.signal(signal.SIGTERM, graceful_shutdown)
-
-    yield  # --- App đang chạy ---
-
+    yield
     print("🛑 Application shutting down...")
-    ready = False
-    graceful_shutdown()
+
 
 
 ###############################################################################
