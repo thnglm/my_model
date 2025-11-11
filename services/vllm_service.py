@@ -174,7 +174,7 @@ class vLLMService:
         # Warmup
         print("🔥 Warming up vLLM engine...")
         async for _ in engine.generate(
-            prompt="hello",
+            prompt="Hello, how are you?",
             sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
             request_id=str(uuid4())
         ):

@@ -52,41 +52,53 @@
 # def health_check():
 #     return {"": 204} if not ready else {"status": "healthy"}
 
-from fastapi import FastAPI, status
-from fastapi.responses import JSONResponse
+import signal
+from fastapi import FastAPI, status, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from api.v1 import routes as v1_routes
 from contextlib import asynccontextmanager
 from services.vllm_service import vLLMService
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 
 ready: bool = False
+engine: AsyncLLMEngine | None = None
+
 
 ###############################################################################
-#          Manage resources with lifespan for safe shutdown and cleanup
+#          Manage resources with lifespan for safe startup and cleanup
 ###############################################################################
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Lifecycle manager - load vLLM engine on startup
+    Lifecycle manager - lazy model loading with graceful shutdown
     """
-    global ready
-    
-    print("🚀 Application starting up - Loading vLLM engine...")
-    try:
-        vllm_engine: AsyncLLMEngine = await vLLMService.init_resource()
-        app.state.vllm_engine = vllm_engine
-        ready = True
-        print("✅ vLLM engine loaded and ready!")
-    except Exception as e:
-        print(f"❌ Failed to load vLLM engine: {e}")
-        ready = False
-        raise  # Re-raise để Modal biết có lỗi
-    
-    yield  # App đang chạy
-    
-    # Cleanup khi shutdown
+    global ready, engine
+
+    print("🚀 Application starting up (lazy vLLM loading)...")
+    ready = False
+
+    # Không load model ngay startup để tránh delay cold start
+    app.state.vllm_engine = None
+
+    # Đăng ký shutdown hook để cleanup gọn
+    def graceful_shutdown(*_):
+        global engine
+        if engine:
+            print("🧹 Graceful shutdown: closing vLLM engine...")
+            try:
+                engine.shutdown()
+            except Exception:
+                pass
+            engine = None
+
+    signal.signal(signal.SIGTERM, graceful_shutdown)
+
+    yield  # --- App đang chạy ---
+
     print("🛑 Application shutting down...")
     ready = False
+    graceful_shutdown()
+
 
 ###############################################################################
 #                      Initialize FastAPI application
@@ -97,38 +109,48 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS setup (nếu cần)
-# from fastapi.middleware.cors import CORSMiddleware
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["http://localhost:8501"],
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
 # Include versioned routers
 app.include_router(v1_routes.router, prefix="/api/v1")
+
+
+###############################################################################
+#                      Dynamic model loader (auto-reconnect)
+###############################################################################
+async def get_engine(app: FastAPI) -> AsyncLLMEngine:
+    """
+    Return active vLLM engine. Auto-init or reconnect if needed.
+    """
+    global ready, engine
+
+    if engine is None:
+        print("⚙️ (Re)initializing vLLM engine...")
+        try:
+            engine = await vLLMService.init_resource()
+            app.state.vllm_engine = engine
+            ready = True
+            print("✅ vLLM engine ready!")
+        except Exception as e:
+            print(f"❌ [Init Error] Failed to start vLLM engine: {e}")
+            ready = False
+            raise
+
+    return engine
+
 
 ###############################################################################
 #                           Health Check Endpoints
 ###############################################################################
-
 @app.get("/")
 async def root():
-    """Root endpoint - basic info"""
     return {
         "name": "AI Chatbot API",
         "version": "1.0.0",
         "status": "running" if ready else "starting"
     }
 
+
 @app.get("/health")
 async def health():
-    """
-    Comprehensive health check - checks if app is ready
-    Use this for readiness probes
-    """
     if not ready:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -138,7 +160,6 @@ async def health():
                 "message": "vLLM engine is still loading"
             }
         )
-    
     return {
         "status": "healthy",
         "ready": True,
@@ -146,12 +167,9 @@ async def health():
         "model": "GRPO-Vi-Qwen2-7B-RAG-W4A16"
     }
 
+
 @app.get("/ready")
 async def readiness():
-    """
-    Readiness probe - Kubernetes/Modal style
-    Returns 200 only when ready to serve requests
-    """
     if not ready:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -159,21 +177,53 @@ async def readiness():
         )
     return {"ready": True}
 
+
 @app.get("/live")
 async def liveness():
-    """
-    Liveness probe - checks if app is alive (not frozen)
-    Always returns 200 if FastAPI is responding
-    """
     return {"alive": True}
 
-# Giữ lại endpoint cũ để backward compatible
+
 @app.get("/ping")
 async def ping():
-    """Legacy health check endpoint"""
     if not ready:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={"status": "starting"}
         )
     return {"status": "healthy"}
+
+
+###############################################################################
+#                   Safe generate endpoint with retry logic
+###############################################################################
+@app.post("/api/v1/generate")
+async def generate(request: Request):
+    """
+    Generate endpoint with auto-reconnect logic for vLLM engine.
+    """
+    global engine, ready
+    data = await request.json()
+    prompt = data.get("prompt", "")
+
+    try:
+        llm_engine = await get_engine(app)
+        stream = vLLMService.generate_answer(llm_engine, prompt)
+        return StreamingResponse(stream, media_type="text/event-stream")
+
+    except Exception as e:
+        print(f"⚠️ [Engine error] {e} — retrying re-init ...")
+        # Reconnect logic nếu engine bị mất do scale-down
+        try:
+            engine = await vLLMService.init_resource()
+            ready = True
+            print("🔁 vLLM engine restarted successfully!")
+            stream = vLLMService.generate_answer(engine, prompt)
+            return StreamingResponse(stream, media_type="text/event-stream")
+        except Exception as e2:
+            print(f"💥 [Critical] Could not recover engine: {e2}")
+            ready = False
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={"error": "Model unavailable, please retry later."}
+            )
+

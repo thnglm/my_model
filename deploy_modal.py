@@ -126,9 +126,9 @@ def upload_local_models():
     },
     gpu="A10G",
     timeout=3600,
-    keep_warm=0,
-    container_idle_timeout=300,
-    scaledown_window=120,
+    # keep_warm=0,
+    min_containers=0,
+    scaledown_window=900,
 
 )
 @modal.asgi_app()
